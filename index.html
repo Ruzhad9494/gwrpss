@@ -586,6 +586,12 @@
                 <span class="dot"></span><span id="netText">Sambungan internet ok</span>
             </div>
 
+            <div id="storeWarn" style="display:none; background:#fdecea; border:1px solid #f5b7b1; color:#922b21; padding:9px 11px; border-radius:4px; font-size:11px; line-height:1.5; margin-bottom:10px;">
+                <b>Peranti ini menyekat simpanan tempatan.</b>
+                Barisan offline tidak aktif. Data hanya wujud selagi borang ini terbuka —
+                jangan tutup sebelum keluar mesej berjaya.
+            </div>
+
             <!-- BARISAN LAPORAN MENUNGGU DIHANTAR -->
             <div id="queueBox" style="display:none;">
                 <div class="q-head">
@@ -1102,6 +1108,66 @@
             });
         }
 
+
+        /* =========================================================
+           LAPISAN SIMPANAN — JANGAN SEKAT PENGGUNA
+
+           Sesetengah peranti menyekat IndexedDB: iPhone dalam Private Mode,
+           in-app browser, atau bila simpanan penuh. Barisan offline adalah
+           perlindungan tambahan, bukan syarat. Kalau ia tak boleh digunakan,
+           sistem teruskan dalam memori dan hantar terus — technician tetap
+           boleh bekerja, cuma tanpa perlindungan kalau browser ditutup.
+           ========================================================= */
+        let storeOk = true;
+        let memQueue = [];
+
+        async function initQueueStore() {
+            try {
+                await openDB();
+                await idbPut({ id: '__probe__' });
+                await idbDelete('__probe__');
+                storeOk = true;
+            } catch (e) {
+                storeOk = false;
+            }
+            updateStoreWarn();
+        }
+
+        function updateStoreWarn() {
+            const el = document.getElementById('storeWarn');
+            if (!el) return;
+            el.style.display = storeOk ? 'none' : 'block';
+        }
+
+        const store = {
+            async put(job) {
+                if (storeOk) {
+                    try { return await store.put(job); } catch (e) { storeOk = false; updateStoreWarn(); }
+                }
+                const i = memQueue.findIndex(function (j) { return j.id === job.id; });
+                if (i >= 0) memQueue[i] = job; else memQueue.push(job);
+                return job;
+            },
+            async del(id) {
+                if (storeOk) {
+                    try { return await store.del(id); } catch (e) { storeOk = false; updateStoreWarn(); }
+                }
+                memQueue = memQueue.filter(function (j) { return j.id !== id; });
+            },
+            async all() {
+                if (storeOk) {
+                    try { return await store.all(); } catch (e) { storeOk = false; updateStoreWarn(); }
+                }
+                return memQueue.slice();
+            },
+            async get(id) {
+                if (storeOk) {
+                    try { return await store.get(id); } catch (e) { storeOk = false; updateStoreWarn(); }
+                }
+                return memQueue.find(function (j) { return j.id === id; }) || null;
+            }
+        };
+
         /* ---------- Bina satu kerja untuk dimasukkan ke barisan ---------- */
         function val(id) {
             const el = document.getElementById(id);
@@ -1197,7 +1263,7 @@
                 res.images.forEach(function (saved, k) {
                     if (chunk[k]) { chunk[k].driveId = saved.id; chunk[k].base64 = ''; }
                 });
-                await idbPut(job);
+                await store.put(job);
             }
 
             // Langkah 2: hantar tindakan utama
@@ -1223,7 +1289,7 @@
             if (queueRunning) return;
 
             let jobs = [];
-            try { jobs = await idbAll(); } catch (err) { return; }
+            try { jobs = await store.all(); } catch (err) { return; }
             const pend = jobs.filter(function (j) { return j.status !== 'done'; })
                              .sort(function (a, b) { return a.createdAt - b.createdAt; });
 
@@ -1237,7 +1303,7 @@
             for (const job of pend) {
                 try {
                     job.status = 'sending';
-                    await idbPut(job);
+                    await store.put(job);
                     renderQueueUI(pend);
 
                     const res = await sendJob(job);
@@ -1250,20 +1316,20 @@
                     } else if (res.staffToken) {
                         currentStaffToken = res.staffToken;
                     }
-                    await idbDelete(job.id);
+                    await store.del(job.id);
                     job.status = 'done';
                 } catch (err) {
                     job.status = 'pending';
                     job.attempts = (job.attempts || 0) + 1;
                     job.lastError = (err && err.message) ? err.message : 'Ralat tidak diketahui';
-                    await idbPut(job);
+                    await store.put(job);
                     break; // berhenti dulu, cuba lagi kemudian
                 }
             }
 
             queueRunning = false;
             setTechProgress('');
-            const after = (await idbAll()).filter(function (j) { return j.status !== 'done'; });
+            const after = (await store.all()).filter(function (j) { return j.status !== 'done'; });
             renderQueueUI(after);
         }
 
@@ -1274,7 +1340,7 @@
             const box = document.getElementById('queueBox');
             if (!box) return;
 
-            if (!jobs) { idbAll().then(function (all) {
+            if (!jobs) { store.all().then(function (all) {
                 renderQueueUI(all.filter(function (j) { return j.status !== 'done'; }));
             }); return; }
 
@@ -1314,7 +1380,7 @@
         function dropQueueJob(id, btn) {
             if (qPendingDrop === id) {
                 qPendingDrop = null;
-                idbDelete(id).then(function () { renderQueueUI(); });
+                store.del(id).then(function () { renderQueueUI(); });
                 return;
             }
             qPendingDrop = id;
@@ -1353,7 +1419,7 @@
             checkAutosave();
             updateNetBar();
             // Sambung semula penghantaran yang tergendala pada sesi lepas
-            processQueue();
+            initQueueStore().then(function () { processQueue(); });
             setTimeout(hideTechLoader, 1200);
         });
 
@@ -2535,14 +2601,14 @@
 
             try {
                 // Simpan dalam phone DAHULU — data tak akan hilang walau apa berlaku
-                await idbPut(job);
+                await store.put(job);
                 renderQueueUI();
                 setTechProgress('Menghantar ke pangkalan data...');
 
                 await processQueue(true);
 
                 hideTechLoader();
-                const still = await idbGet(job.id);
+                const still = await store.get(job.id);
 
                 if (!still) {
                     msgBox.style.background = "#d4edda";
@@ -2622,7 +2688,7 @@
                 // 2) Masuk barisan — disimpan dalam peranti sebelum cuba hantar
                 setTechProgress('Menyimpan dalam peranti...');
                 const job = buildJob('submit_report', pdfBase64, staffSigBase64);
-                await idbPut(job);
+                await store.put(job);
                 renderQueueUI();
 
                 // 3) Cuba hantar sekarang
@@ -2630,7 +2696,7 @@
                 await processQueue(true);
 
                 hideTechLoader();
-                const still = await idbGet(job.id);
+                const still = await store.get(job.id);
 
                 if (still) {
                     msgBox.style.background = "#fef9e7";
